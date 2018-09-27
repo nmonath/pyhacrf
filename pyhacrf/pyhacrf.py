@@ -10,7 +10,6 @@ from .algorithms import forward_predict, forward_max_predict
 from .algorithms import gradient, gradient_sparse, populate_sparse_features, sparse_multiply
 from .state_machine import DefaultStateMachine
 
-
 class Hacrf(object):
     """ Hidden Alignment Conditional Random Field with L2 regularizer.
 
@@ -61,7 +60,7 @@ class Hacrf(object):
         self._states_to_classes = None
         self._evaluation_count = None
 
-    def fit(self, X, y, verbosity=0):
+    def fit(self, X, y, verbosity=0,init=False):
         """Fit the model according to the given training data.
 
         Parameters
@@ -88,7 +87,8 @@ class Hacrf(object):
             self._state_machine = DefaultStateMachine(self.classes)
 
         # Initialize the parameters given the state machine, features, and target classes.
-        self.parameters = self._initialize_parameters(self._state_machine, X[0].shape[2])
+        if init:
+            self.parameters = self._initialize_parameters(self._state_machine, X[0].shape[2])
 
         # Create a new model object for each training example
         models = [_Model(self._state_machine, x, ty) for x, ty in zip(X, y)]
@@ -127,6 +127,124 @@ class Hacrf(object):
 
         if self._optimizer:
             self.optimizer_result = self._optimizer(_objective, self.parameters.flatten(), **self._optimizer_kwargs)
+            # print("self.optimizer_result = {}".format(self.optimizer_result))
+            # print("self.parameters = {}".format(self.parameters))
+            self.parameters = self.optimizer_result[0].reshape(self.parameters.shape)
+        else:
+            optimizer = lbfgs.LBFGS()
+            optimizer.epsilon = 99999
+            final_betas = optimizer.minimize(_objective_copy_gradient,
+                                            x0=self.parameters.flatten(),
+                                            progress=None)
+
+            self.optimizer_result = final_betas
+            self.parameters = final_betas.reshape(self.parameters.shape)
+        return self
+
+
+
+    def fit_par(self, X, y, verbosity=0,init=False):
+        """Fit the model according to the given training data.
+
+        Parameters
+        ----------
+        X : List of ndarrays, one for each training example.
+            Each training example's shape is (string1_len, string2_len, n_features), where
+            string1_len and string2_len are the length of the two training strings and n_features the
+            number of features.
+
+        y : array-like, shape (n_samples,)
+            Target vector relative to X.
+
+        Returns
+        -------
+        self : object
+            Returns self.
+        """
+        print("training with parallelization")
+        self.classes = list(set(y))
+        n_points = len(y)
+        if len(X) != n_points:
+            raise Exception('Number of training points should be the same as training labels.')
+
+        if not self._state_machine:
+            self._state_machine = DefaultStateMachine(self.classes)
+
+        # Initialize the parameters given the state machine, features, and target classes.
+        if init:
+            self.parameters = self._initialize_parameters(self._state_machine, X[0].shape[2])
+
+        # Create a new model object for each training example
+        models = [_Model(self._state_machine, x, ty) for x, ty in zip(X, y)]
+
+        self._evaluation_count = 0
+
+        def _objective(parameters):
+            gradient = np.zeros(self.parameters.shape)
+            ll = 0.0  # Log likelihood
+            # TODO: Embarrassingly parallel
+            pool = ProcessingPool(24)
+            def process_model(ms):
+                dlls = []
+                dgrads = []
+                for m in ms:
+                    dl,dg = m.forward_backward(parameters.reshape(self.parameters.shape))
+                    dlls.append(dl)
+                    dgrads.append(dg)
+                return dlls,dgrads
+
+            grouped = list(zip(*[iter(models)] * 100))
+
+            for dlls, dgradients in pool.uimap(process_model,grouped):
+                for dll in dlls:
+                    ll += dll
+                for dgradient in dgradients:
+                    gradient += dgradient
+
+            parameters_without_bias = np.array(parameters, dtype='float64')  # exclude the bias parameters from being regularized
+            parameters_without_bias[0] = 0
+            ll -= self.l2_regularization * np.dot(parameters_without_bias.T, parameters_without_bias)
+            gradient = gradient.flatten() - 2.0 * self.l2_regularization * parameters_without_bias
+
+            if verbosity > 0:
+                if self._evaluation_count == 0:
+                    print('{:10} {:10} {:10}'.format('Iteration', 'Log-likelihood', '|gradient|'))
+                if self._evaluation_count % verbosity == 0:
+                    print('{:10} {:10.4} {:10.4}'.format(self._evaluation_count, ll, (abs(gradient).sum())))
+            self._evaluation_count += 1
+
+            # TODO: Allow some of the parameters to be frozen. ie. not trained. Can later also completely remove
+            # TODO:     the computation associated with these parameters.
+            return -ll, -gradient
+
+        def _objective_copy_gradient(paramers, g):
+            nll, ngradient = _objective(paramers)
+            g[:] = ngradient
+            return nll
+
+        if self._optimizer:
+            self.optimizer_result = self._optimizer(_objective, self.parameters.flatten(), **self._optimizer_kwargs)
+            # print("self.optimizer_result = {}".format(self.optimizer_result))
+            # print("self.parameters = {}".format(self.parameters))
+            self.parameters = self.optimizer_result[0].reshape(self.parameters.shape)
+        else:
+            optimizer = lbfgs.LBFGS()
+            optimizer.epsilon = 99999
+            final_betas = optimizer.minimize(_objective_copy_gradient,
+                                            x0=self.parameters.flatten(),
+                                            progress=None)
+
+            self.optimizer_result = final_betas
+            self.parameters = final_betas.reshape(self.parameters.shape)
+        return self
+
+        def _objective_copy_gradient(paramers, g):
+            nll, ngradient = _objective(paramers)
+            g[:] = ngradient
+            return nll
+
+        if self._optimizer:
+            self.optimizer_result = self._optimizer(_objective, self.parameters.flatten(), **self._optimizer_kwargs)
             self.parameters = self.optimizer_result[0].reshape(self.parameters.shape)
         else:
             optimizer = lbfgs.LBFGS()
@@ -136,6 +254,7 @@ class Hacrf(object):
             self.optimizer_result = final_betas
             self.parameters = final_betas.reshape(self.parameters.shape)
         return self
+
 
     def predict_proba(self, X):
         """Probability estimates.
